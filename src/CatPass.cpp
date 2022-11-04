@@ -547,7 +547,7 @@ namespace {
         }
         setINAndOUT(F);
       }
-
+    
     bool runOnFunction (Function &F) override {
       GENINAndOUT(F);
       optimizeFunction(F);
