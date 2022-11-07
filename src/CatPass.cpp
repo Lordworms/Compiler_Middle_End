@@ -31,13 +31,15 @@ using namespace std;
 namespace {
   struct CAT : public FunctionPass {
     static char ID; 
-    unordered_map<Instruction*,int>ssaVarOrder;
-    unordered_map<int,Instruction*>orderSsaVar;
-    unordered_map<Instruction*,BitVector>GEN,KILL,IN,OUT;
+    unordered_map<Value*,int>ssaVarOrder;//ssaVar contains cat_new cat_add cat_sub cat_set and new function
+    unordered_map<int,Value*>orderSsaVar;
+    unordered_map<Value*,BitVector>GEN,KILL,IN,OUT;
     set<StringRef>catFuncName;
-    unordered_map<int,BitVector>ssaCluster;
-    unordered_map<Instruction*,BitVector>ssaBit;
+    unordered_map<Value*,BitVector>mayAlias;
+    unordered_map<int,BitVector>mustAlias;
+    unordered_map<Value*,BitVector>ssaBit;
     int totalCnt=0;
+    bool isPause=true;
     vector<bool>ssaVarDel;
     CAT() : FunctionPass(ID) {}
 
@@ -53,7 +55,7 @@ namespace {
       ssaVarOrder.clear();
       orderSsaVar.clear();
       GEN.clear();KILL.clear();IN.clear();OUT.clear();
-      ssaCluster.clear();
+      mustAlias.clear();
       ssaBit.clear();
       totalCnt=0;
     }
@@ -69,12 +71,13 @@ namespace {
         if(funcName=="CAT_new")
         {
           //errs()<<"it is new!"<<"\n";
-          ssaCluster[ssaVarOrder[ins]]|=ssaBit[ins];
+          mustAlias[ssaVarOrder[ins]]|=ssaBit[ins];
         }
         else if(catFuncName.count(funcName))
         {
           //errs()<<*ins<<"\n";
           auto op=dyn_cast<Instruction>(inst->getOperand(0));
+          if(funcName=="CAT_set"&&isa<SExtInst>(inst->getOperand(1)))return;
           if(isa<PHINode>(inst->getOperand(0)))//we need a queue to get everything of this instruction
           {
             auto phi=dyn_cast<PHINode>(inst->getOperand(0));
@@ -91,7 +94,7 @@ namespace {
                   if(calVar->getCalledFunction()->getName()=="CAT_new")
                   {
                     //errs()<<"it is a new "<<*calVar<<"\n";
-                    if(ssaVarOrder.find(calVar)!=ssaVarOrder.end())ssaCluster[ssaVarOrder[calVar]]|=ssaBit[inst];
+                    if(ssaVarOrder.find(calVar)!=ssaVarOrder.end())mustAlias[ssaVarOrder[calVar]]|=ssaBit[inst];
                   }
                 }
                 else if(auto phiVar=dyn_cast<PHINode>(tmp->getOperand(i)))
@@ -104,10 +107,10 @@ namespace {
           else
           {
             //errs()<<"it is a variable"<<"\n";
-            if(ssaVarOrder.find(op)!=ssaVarOrder.end())ssaCluster[ssaVarOrder[op]]|=ssaBit[ins];//for new
+            if(ssaVarOrder.find(op)!=ssaVarOrder.end())mustAlias[ssaVarOrder[op]]|=ssaBit[ins];//for new
           }
         }
-        else if(ssaVarOrder.count(inst))
+        else if(ssaVarOrder.count(inst))//it is a new function
         {
           //errs()<<"new function!"<<*inst<<":\n";
           for(uint i=0;i<inst->getNumOperands();++i)
@@ -117,7 +120,8 @@ namespace {
               if(ssaVarOrder.find(var)!=ssaVarOrder.end())
               {
                 //errs()<<*var<<"\n";
-                ssaCluster[ssaVarOrder[var]]|=ssaBit[ins];
+                mustAlias[ssaVarOrder[var]]|=ssaBit[ins];
+                mayAlias[var]|=ssaBit[ins];
               }
             }
           }
@@ -143,9 +147,9 @@ namespace {
       ssaBit.erase(bef);
       bef=nullptr;
     }
-    void setGenAndKill(Instruction* ins)//kill[ins]^=ssaCluster[var]
+    void setGenAndKill(Instruction* ins)//kill[ins]^=mustAlias[var]
     {
-      //errs()<<*ins<<"\n";
+      //errs()<<"set gen and kill for inst "<<*ins<<"\n";
       BitVector gen(totalCnt,false),kill(totalCnt,false);
       if(isa<CallInst>(ins))
       {
@@ -154,13 +158,22 @@ namespace {
         if(funcName=="CAT_new")
         {
           gen[ssaVarOrder[ins]]=true;
-          kill^=ssaCluster[ssaVarOrder[ins]];
+          kill^=mustAlias[ssaVarOrder[ins]];
           kill[ssaVarOrder[ins]]=false;
         }
         else if(catFuncName.count(funcName)||funcName=="CAT_get")
         {
           auto var=dyn_cast<Instruction>(inst->getOperand(0));
           if(catFuncName.count(funcName))gen[ssaVarOrder[ins]]=true;
+          if(funcName=="CAT_set")
+          {
+            //errs()<<"operand is "<<*(inst->getOperand(1))<<"\n";
+          }
+          if(funcName=="CAT_set"&&(isa<SExtInst>(inst->getOperand(1))))
+          {
+            //errs()<<"Cannot propagate the set"<<"\n";
+            goto setfail;
+          }
           if(var&&isa<PHINode>(var))
           {
             queue<PHINode*>q;
@@ -179,8 +192,8 @@ namespace {
                   if(calVar->getCalledFunction()->getName()=="CAT_new")
                   {
                     //errs()<<"the var is "<<*calVar<<"\nbit is\n";
-                    printBit(ssaCluster[ssaVarOrder[calVar]]);
-                    kill|=ssaCluster[ssaVarOrder[calVar]];
+                    //printBit(mustAlias[ssaVarOrder[calVar]]);
+                    kill|=mustAlias[ssaVarOrder[calVar]];
                     kill[ssaVarOrder[calVar]]=false;
                   }
                 }
@@ -194,21 +207,20 @@ namespace {
           else if(catFuncName.count(funcName))
           {
             //errs()<<"set kill for "<<*inst<<"\n";
-            //printBit(ssaCluster[ssaVarOrder[var]]);
-            if(ssaVarOrder.find(var)!=ssaVarOrder.end())kill|=ssaCluster[ssaVarOrder[var]];
+            //printBit(mustAlias[ssaVarOrder[var]]);
+            if(ssaVarOrder.find(var)!=ssaVarOrder.end())kill|=mustAlias[ssaVarOrder[var]];
             kill[ssaVarOrder[ins]]=false;
           }
         }
         else if(ssaVarOrder.find(ins)!=ssaVarOrder.end())//for new instruction like p
         {
           gen[ssaVarOrder[ins]]=true;
-          kill^=ssaCluster[ssaVarOrder[ins]];
-          kill[ssaVarOrder[ins]]=false;
+          kill=getModify(dyn_cast<CallInst>(ins));
         }
       }
       else if(auto inst=dyn_cast<StoreInst>(ins))
       {
-        kill|=ssaCluster[ssaVarOrder[dyn_cast<CallInst>(inst->getValueOperand())]];
+        kill|=mustAlias[ssaVarOrder[dyn_cast<CallInst>(inst->getValueOperand())]];
         kill[ssaVarOrder[inst]]=false;
       }
       else if(auto inst=dyn_cast<LoadInst>(ins))
@@ -216,6 +228,8 @@ namespace {
         //errs()<<"it is a load inst:"<<*ins<<"\n"; 
         //errs()<<*(inst->getOperand(0))<<"\n";
       }
+      setfail:
+      ;
       GEN[ins]=gen;
       KILL[ins]=kill; 
       
@@ -281,14 +295,15 @@ namespace {
         }
       }
     }
-    void addVar(Instruction* I)
+    void addVar(Value* I)
     {
       ssaVarOrder[I]=totalCnt;
       orderSsaVar[totalCnt++]=I;
     }
     void init(Function &F)
     {
-      clear();
+      //clear();
+      //add all value
       for(auto& I:instructions(F))
       {
         if(isa<CallInst>(&I))
@@ -301,6 +316,10 @@ namespace {
           }
         }
         else if(isa<StoreInst>(&I))addVar(&I);
+        else if(isa<LoadInst>(&I))
+        {
+
+        }
       }
       function<bool(CallInst*)>check=[&](CallInst* inst)
       {
@@ -310,10 +329,8 @@ namespace {
         {
           if(auto var=dyn_cast<CallInst>(inst->getOperand(i)))
           {
-            if(ssaVarOrder.find(var)!=ssaVarOrder.end())
-            {
-              isVariable=true;
-            }
+            isVariable=true;
+            break;
           }
         }
         if(isVariable)addVar(inst);
@@ -355,11 +372,12 @@ namespace {
     {
       unordered_set<CallInst*>delList;
       auto op=inst->getOperand(0);
-      while(inst->getPrevNode()&&isa<CallInst>(inst->getPrevNode())&&(dyn_cast<CallInst>(inst->getPrevNode()))->getCalledFunction()->getName()=="CAT_set")
+      while(inst->getPrevNode()&&isa<CallInst>(inst->getPrevNode())&&catFuncName.count((dyn_cast<CallInst>(inst->getPrevNode()))->getCalledFunction()->getName()))
       {
         auto pre=dyn_cast<CallInst>(inst->getPrevNode());
         if(pre->getOperand(0)==op)
         {
+          ssaVarDel[ssaVarOrder[pre]]=true;
           delList.insert(pre);
         }
         inst=pre;
@@ -386,13 +404,16 @@ namespace {
       {
         auto inst=q.front();
         q.pop();
+        aliasOptimization(F);
         //errs()<<"do propagation for ins "<<*inst<<"\n";
         auto funcName=inst->getCalledFunction()->getName();
         ConstantInt* value=nullptr;
+        //bool isDelete=false;
         if((value=constantFolding(inst)))
         {
           if(funcName=="CAT_add"||funcName=="CAT_sub")
           {
+            //isDelete=true;
             IRBuilder<> builder(inst);
             CallInst* newInst=builder.CreateCall(F.getParent()->getFunction("CAT_set"),{inst->getOperand(0),value});
             newInst->setTailCall();
@@ -401,18 +422,25 @@ namespace {
             q.push(newInst);
           }
           if(funcName=="CAT_get")inst->replaceAllUsesWith(value);
-          if((funcName=="CAT_set"||funcName=="CAT_get")&&!deadCodeCheck(inst))
+          if((funcName=="CAT_get"||funcName=="CAT_set")&&!deadCodeCheck(inst))
           {
             delList.insert(inst);
+            if(funcName=="CAT_set")ssaVarDel[ssaVarOrder[inst]]=true;
           }
         }
-       //errs()<<F<<"\n";
-        //printCluster();
+        /*
+        if((funcName=="CAT_set"||funcName=="CAT_get"||((funcName=="CAT_add"||funcName=="CAT_sub")&&isDelete==false))&&!deadCodeCheck(inst))
+        {
+          delList.insert(inst);
+        }
+        */
+        //errs()<<F<<"\n";
+        //printMustAlias();
         //errs()<<"\n\n\n";
       }
       for(auto &I:delList)
       {
-        //errs()<<"removed "<<*I<<"\n";
+        errs()<<"removed "<<*I<<"\n";
         I->eraseFromParent();
       }
       for(auto& I:instructions(F))
@@ -426,12 +454,14 @@ namespace {
     ConstantInt* uniqueNess(BitVector &instBit)
     {
       int varCnt=0;
+      errs()<<"find uniqueNess!"<<"\n";
       ConstantInt* res=nullptr;
       for(uint i=0;i<instBit.size();++i)
       {
         ConstantInt* value=nullptr;
         if(instBit[i])
         {
+          errs()<<*orderSsaVar[i]<<"\n";
           ++varCnt;
           auto var=dyn_cast<CallInst>(orderSsaVar[i]);
           if(var==nullptr)continue;//for storeinst and load inst
@@ -495,8 +525,8 @@ namespace {
                 //errs()<<"the var is "<<*varCal<<"\n";
                 //errs()<<"get the phi bit!"<<"\n";
                 //printBit(phiBit);
-                phiBit&=ssaCluster[ssaVarOrder[varCal]];
-                //printBit(ssaCluster[ssaVarOrder[varCal]]);
+                phiBit&=mustAlias[ssaVarOrder[varCal]];
+                //printBit(mustAlias[ssaVarOrder[varCal]]);
                 //printBit(phiBit);
                 value=uniqueNess(phiBit);
                 //if(value)errs()<<value->getSExtValue()<<"\n";
@@ -529,6 +559,7 @@ namespace {
     bool deadCodeCheck(CallInst* inst)
     {
       auto funcName=inst->getCalledFunction()->getName();
+      //errs()<<"check dead for inst:"<<*inst<<"\n";
       if(funcName=="CAT_set")
       {
         auto var=inst->getOperand(0);
@@ -552,13 +583,13 @@ namespace {
         auto op=inst->getOperand(0);
         if(auto var=dyn_cast<CallInst>(op))
         {
-          //errs()<<*var<<"\n";
+          errs()<<*var<<"\n";
           auto instBit=IN[inst];
-          //errs()<<"its in set"<<"\n";
-          //printBit(instBit);
-          instBit&=ssaCluster[ssaVarOrder[var]];
-          //printBit(ssaCluster[ssaVarOrder[var]]);
-          //printBit(instBit);
+          errs()<<"its in set"<<"\n";
+          printBit(instBit);
+          instBit&=mustAlias[ssaVarOrder[var]];
+          printBit(mustAlias[ssaVarOrder[var]]);
+          printBit(instBit);
           res=uniqueNess(instBit);
         }
         else if(auto var=dyn_cast<PHINode>(op))
@@ -587,9 +618,9 @@ namespace {
           auto opBit=IN[inst];
           //errs()<<*varCal<<"\n";
           //printBit(opBit);
-          ssaCluster[ssaVarOrder[varCal]];
-          //printBit(ssaCluster[ssaVarOrder[varCal]]);
-          opBit&=ssaCluster[ssaVarOrder[varCal]];
+          mustAlias[ssaVarOrder[varCal]];
+          //printBit(mustAlias[ssaVarOrder[varCal]]);
+          opBit&=mustAlias[ssaVarOrder[varCal]];
           v1=uniqueNess(opBit);
           //printBit(opBit);
         }
@@ -602,8 +633,8 @@ namespace {
           auto opBit=IN[inst];
           //errs()<<*varCal<<"\n";
           //printBit(opBit);
-          //printBit(ssaCluster[ssaVarOrder[varCal]]);
-          opBit&=ssaCluster[ssaVarOrder[varCal]];
+          //printBit(mustAlias[ssaVarOrder[varCal]]);
+          opBit&=mustAlias[ssaVarOrder[varCal]];
           v2=uniqueNess(opBit);
           //printBit(opBit);
         }
@@ -617,14 +648,86 @@ namespace {
       }
       return res;
     }
+    bool aliasOptimization(Function& F)//alias modify
+    {
+      AliasAnalysis &aa = getAnalysis<AAResultsWrapperPass>().getAAResults();
+      unordered_set<Instruction*>killList;
+      for(auto& I:instructions(F))
+      {
+        if(isPause)break;
+        if(auto inst=dyn_cast<CallInst>(&I))
+        {
+          auto op=inst->getOperand(0);
+          for(auto [var,index]:ssaVarOrder)
+          {
+            if(auto calVar=dyn_cast<CallInst>(var))
+            {
+              if(calVar->getCalledFunction()->getName()=="CAT_new")
+              {
+                switch(aa.alias(op,var))
+                {
+                  case AliasResult::MustAlias:
+                    killList.insert(inst);
+                    break;
+                  default:
+                    break;
+                }
+              }
+            }
+          }
+        }
+      }
+      for(auto& I:killList)I->eraseFromParent();
+      return false;
+    }
+    BitVector getModify(CallInst* inst)
+    {
+      BitVector ans(totalCnt,false);
+      errs()<<"finding modify ptr for ins "<<*inst<<"\n";
+      AliasAnalysis &aa = getAnalysis<AAResultsWrapperPass>().getAAResults();
+      for(uint i=0;i<inst->getNumOperands();++i)
+      {
+        uint size=0;
+        if(auto op=dyn_cast<CallInst>(inst->getOperand(i)))
+        {
+          if(auto type=dyn_cast<PointerType>(inst->getType()))
+          {
+            auto elementPointedType=type->getNonOpaquePointerElementType();
+            if(elementPointedType->isSized())
+            {
+              size=inst->getModule()->getDataLayout().getTypeStoreSize(elementPointedType);
+            }
+          }
+          if(op->getCalledFunction()->getName()=="CAT_new")
+          {
+            switch(aa.getModRefInfo(inst,op,size))
+            {
+              case ModRefInfo::ModRef:
+              case ModRefInfo::MustModRef:
+              case ModRefInfo::Mod:
+                ans|=mustAlias[ssaVarOrder[op]];
+                errs()<<"it modified "<<op<<"\n";
+                break;
+              default:
+                break;
+            }
+          }
+        }
+      } 
+      ans[ssaVarOrder[inst]]=false;
+      return ans;
+    }
     bool runOnFunction (Function &F) override {
+      //errs()<<"operands number "<<F.getNumOperands()<<"\n";
+      //for(uint i=0;i<F.getNumOperands();++i)errs()<<*(F.getOperand(i))<<"\n";
       //errs()<<F<<"\n";
       init(F);
-      
+      //printMustAlias();
+      //printInAndOut(F);
       //printVar();
       //printSet();
-      //printCluster();
       constantPropagation(F);
+      //printMustAlias();
       //errs()<<F<<"\n";
       return false;
     }
@@ -686,18 +789,19 @@ namespace {
         printBit(KILL[tmp]);
       }
     }
-    void printCluster()
+    void printMustAlias()
     {
-      errs()<<"ssaCluster:"<<"\n";
-      for(auto& k:ssaCluster)
+      errs()<<"mustAlias:"<<"\n";
+      for(auto& k:mustAlias)
       {
         errs()<<*orderSsaVar[k.first]<<":\n";
         printBit(k.second);
         for(uint i=0;i<k.second.size();++i)
         {
-          if(k.second[i]==true)
+          if(k.second[i]==true&&!ssaVarDel[i])
           {
-            if(orderSsaVar[i]!=nullptr)errs()<<*orderSsaVar[i]<<" "<<ssaVarOrder[orderSsaVar[i]]<<"\n";
+            //errs()<<*orderSsaVar[i]<<" "<<ssaVarOrder[orderSsaVar[i]]<<"\n";
+            if(orderSsaVar[i]!=nullptr)errs()<<orderSsaVar[i]<<" "<<*orderSsaVar[i]<<" "<<ssaVarOrder[orderSsaVar[i]]<<"\n";
             else errs()<<ssaVarOrder[orderSsaVar[i]]<<"\n";
           }
         }
@@ -721,6 +825,7 @@ namespace {
       }
     }
     void getAnalysisUsage(AnalysisUsage &AU) const override {
+      AU.addRequired<AAResultsWrapperPass>();
       AU.setPreservesAll();
     }
   };
