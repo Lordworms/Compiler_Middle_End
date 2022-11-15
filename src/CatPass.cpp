@@ -7,6 +7,7 @@
 #include "llvm/IR/InstIterator.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/IR/BasicBlock.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/BitVector.h"
@@ -721,6 +722,7 @@ namespace {
       //errs()<<"operands number "<<F.getNumOperands()<<"\n";
       //for(uint i=0;i<F.getNumOperands();++i)errs()<<*(F.getOperand(i))<<"\n";
       //errs()<<F<<"\n";
+      cloneTest(F);
       init(F);
       //printMustAlias();
       //printInAndOut(F);
@@ -730,6 +732,43 @@ namespace {
       //printMustAlias();
       //errs()<<F<<"\n";
       return false;
+    }
+    bool checkRecursive(Function& F)
+    {
+      auto fName=F.getName();
+      for(auto& I:instructions(F))
+      {
+        if(auto inst=dyn_cast<CallInst>(&I))
+        {
+          auto funcName=inst->getCalledFunction()->getName();
+          if(funcName==fName)return true;
+        }
+      }
+      return false;
+    }
+    void cloneTest(Function& F)
+    {
+      unordered_set<CallInst*>rep;
+      auto fName=F.getName();
+      for(auto &I:instructions(F))
+      {
+        if(auto inst=dyn_cast<CallInst>(&I))
+        {
+          auto callee=inst->getCalledFunction();
+          auto funcName=callee->getName();
+          if(!catFuncName.count(funcName)&&funcName!="CAT_get"&&fName!=funcName&&!checkRecursive(*callee))
+          {
+            errs()<<"replace function for ins "<<*inst<<"\n";
+            errs()<<"replace "<<funcName<<"\n";
+            rep.insert(inst);
+          }
+        }
+      }
+      for(auto inst:rep)
+      {
+        InlineFunctionInfo  IFI;
+        auto inlinedResult = InlineFunction(*inst, IFI);
+      }
     }
     void printUse(Instruction* I)
     {
