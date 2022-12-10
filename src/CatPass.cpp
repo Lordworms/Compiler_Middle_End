@@ -1,21 +1,39 @@
+#include "llvm/ADT/Statistic.h"
 #include "llvm/Pass.h"
-#include "llvm/IR/Function.h"
-#include "llvm/Support/raw_ostream.h"
-#include "llvm/IR/LegacyPassManager.h"
-#include "llvm/Transforms/IPO/PassManagerBuilder.h"
-#include "llvm/IR/Instructions.h"
 #include "llvm/IR/InstIterator.h"
-#include "llvm/Support/Casting.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/BasicBlock.h"
-#include "llvm/Transforms/Utils/Cloning.h"
+#include "llvm/IR/CFG.h"
+#include "llvm/IR/InstrTypes.h"
+#include "llvm/Transforms/Utils/LoopPeel.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/BitVector.h"
-#include "llvm/ADT/SparseBitVector.h"
+#include "llvm/Support/raw_ostream.h"
+#include "llvm/IR/LegacyPassManager.h"
+#include "llvm/Transforms/IPO/PassManagerBuilder.h"
+#include "llvm/Analysis/AliasSetTracker.h"
+#include "llvm/Analysis/AliasAnalysis.h"
+#include "llvm/Analysis/CallGraph.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IRBuilder.h"
-#include "llvm/Transforms/Utils/Local.h"
-#include "llvm/Analysis/AliasAnalysis.h"
+#include "llvm/IR/Use.h"
+#include "llvm/Analysis/ConstantFolding.h"
+#include "llvm/IR/DataLayout.h"
+#include "llvm/IR/GlobalValue.h"
+#include "llvm/Analysis/OptimizationRemarkEmitter.h"
+#include "llvm/IR/Dominators.h"
+#include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Transforms/Utils/LoopUtils.h"
+#include "llvm/Transforms/Utils/UnrollLoop.h"
+#include "llvm/Analysis/AssumptionCache.h"
+#include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Analysis/ScalarEvolutionExpressions.h"
+#include "llvm/Transforms/Utils/LoopRotationUtils.h"
+#include "llvm/Analysis/InstructionSimplify.h"
 #include <climits>
 #include <concepts>
 #include <set>
@@ -30,7 +48,7 @@
 using namespace llvm;
 using namespace std;
 namespace {
-  struct CAT : public FunctionPass {
+  struct CAT : public ModulePass {
     static char ID; 
     unordered_map<Value*,int>ssaVarOrder;//ssaVar contains cat_new cat_add cat_sub cat_set and new function
     unordered_map<int,Value*>orderSsaVar;
@@ -39,12 +57,20 @@ namespace {
     unordered_map<Value*,BitVector>mayAlias;
     unordered_map<int,BitVector>mustAlias;
     unordered_map<Value*,BitVector>ssaBit;
+    const DataLayout *DL;
+    Function* mainF;
     int totalCnt=0;
     bool isPause=true;
+    int maxDep=0;
+    bool canDelete=false;
     vector<bool>ssaVarDel;
-    CAT() : FunctionPass(ID) {}
+    CAT() : ModulePass(ID) {}
 
     bool doInitialization (Module &M) override {
+      mainF = M.getFunction("main");
+      //errs()<<*mainF<<'\n'
+      canDelete=getDetele();
+      DL = &((&M)->getDataLayout());
       catFuncName.insert("CAT_new");
       catFuncName.insert("CAT_add");
       catFuncName.insert("CAT_sub");
@@ -78,7 +104,7 @@ namespace {
         {
           //errs()<<*ins<<"\n";
           auto op=dyn_cast<Instruction>(inst->getOperand(0));
-          if(funcName=="CAT_set"&&isa<SExtInst>(inst->getOperand(1)))return;
+          //if(funcName=="CAT_set"&&isa<SExtInst>(inst->getOperand(1)))return;
           if(isa<PHINode>(inst->getOperand(0)))//we need a queue to get everything of this instruction
           {
             auto phi=dyn_cast<PHINode>(inst->getOperand(0));
@@ -388,6 +414,7 @@ namespace {
     void constantPropagation(Function& F)
     {
       queue<CallInst*>q;
+      unordered_set<CallInst*>delList;
       ssaVarDel=vector<bool>(totalCnt,false);
       for(auto& I:instructions(F))
       {
@@ -398,9 +425,12 @@ namespace {
           {
             q.push(inst);
           }
+          if(funcName=="CAT_new"&&inst->getNumUses()==0&&canDelete)
+          {
+            delList.insert(inst);
+          }
         }
       }
-      unordered_set<CallInst*>delList;
       while(!q.empty())
       {
         auto inst=q.front();
@@ -429,6 +459,16 @@ namespace {
             if(funcName=="CAT_set")ssaVarDel[ssaVarOrder[inst]]=true;
           }
         }
+        for(auto& I:instructions(F))
+        {
+          if(auto inst=dyn_cast<CallInst>(&I))
+          {
+            if(funcName=="CAT_new"&&inst->getNumUses()==0)
+            {
+              delList.insert(inst);
+            }
+          } 
+        }
         /*
         if((funcName=="CAT_set"||funcName=="CAT_get"||((funcName=="CAT_add"||funcName=="CAT_sub")&&isDelete==false))&&!deadCodeCheck(inst))
         {
@@ -441,7 +481,7 @@ namespace {
       }
       for(auto &I:delList)
       {
-        errs()<<"removed "<<*I<<"\n";
+        //errs()<<"removed "<<*I<<"\n";
         I->eraseFromParent();
       }
       for(auto& I:instructions(F))
@@ -455,7 +495,7 @@ namespace {
     ConstantInt* uniqueNess(BitVector &instBit)
     {
       int varCnt=0;
-      errs()<<"find uniqueNess!"<<"\n";
+      //errs()<<"find uniqueNess!"<<"\n";
       ConstantInt* res=nullptr;
       for(uint i=0;i<instBit.size();++i)
       {
@@ -474,6 +514,13 @@ namespace {
           else if(varName=="CAT_set")
           {
             value=dyn_cast<ConstantInt>(var->getOperand(1));
+            if(auto phi=dyn_cast<PHINode>(var->getOperand(1)))
+            {
+              if(auto con=dyn_cast<ConstantInt>(phi->getOperand(0)))
+              {
+                value=con;
+              }
+            }
           }
           else if(varName=="CAT_add"||varName=="CAT_sub")
           {
@@ -555,6 +602,7 @@ namespace {
           if(varCnt>=1)return nullptr;
         }
       }
+      errs()<<"find shit for phiNode "<<*phi<<" "<<*inst<<'\n';
       return res;
     }
     bool deadCodeCheck(CallInst* inst)
@@ -584,13 +632,13 @@ namespace {
         auto op=inst->getOperand(0);
         if(auto var=dyn_cast<CallInst>(op))
         {
-          errs()<<*var<<"\n";
+          //errs()<<*var<<"\n";
           auto instBit=IN[inst];
-          errs()<<"its in set"<<"\n";
-          printBit(instBit);
+          //errs()<<"its in set"<<"\n";
+          //printBit(instBit);
           instBit&=mustAlias[ssaVarOrder[var]];
-          printBit(mustAlias[ssaVarOrder[var]]);
-          printBit(instBit);
+          //printBit(mustAlias[ssaVarOrder[var]]);
+          //printBit(instBit);
           res=uniqueNess(instBit);
         }
         else if(auto var=dyn_cast<PHINode>(op))
@@ -651,7 +699,7 @@ namespace {
     }
     bool aliasOptimization(Function& F)//alias modify
     {
-      AliasAnalysis &aa = getAnalysis<AAResultsWrapperPass>().getAAResults();
+      AliasAnalysis &aa = getAnalysis<AAResultsWrapperPass>(F).getAAResults();
       unordered_set<Instruction*>killList;
       for(auto& I:instructions(F))
       {
@@ -684,8 +732,8 @@ namespace {
     BitVector getModify(CallInst* inst)
     {
       BitVector ans(totalCnt,false);
-      errs()<<"finding modify ptr for ins "<<*inst<<"\n";
-      AliasAnalysis &aa = getAnalysis<AAResultsWrapperPass>().getAAResults();
+      //errs()<<"finding modify ptr for ins "<<*inst<<"\n";
+      AliasAnalysis &aa = getAnalysis<AAResultsWrapperPass>(*(inst->getFunction())).getAAResults();
       for(uint i=0;i<inst->getNumOperands();++i)
       {
         uint size=0;
@@ -707,7 +755,7 @@ namespace {
               case ModRefInfo::MustModRef:
               case ModRefInfo::Mod:
                 ans|=mustAlias[ssaVarOrder[op]];
-                errs()<<"it modified "<<op<<"\n";
+                //errs()<<"it modified "<<op<<"\n";
                 break;
               default:
                 break;
@@ -718,19 +766,151 @@ namespace {
       ans[ssaVarOrder[inst]]=false;
       return ans;
     }
-    bool runOnFunction (Function &F) override {
-      //errs()<<"operands number "<<F.getNumOperands()<<"\n";
-      //for(uint i=0;i<F.getNumOperands();++i)errs()<<*(F.getOperand(i))<<"\n";
-      //errs()<<F<<"\n";
-      cloneTest(F);
-      init(F);
-      //printMustAlias();
-      //printInAndOut(F);
-      //printVar();
-      //printSet();
-      constantPropagation(F);
-      //printMustAlias();
-      //errs()<<F<<"\n";
+    bool hasCatInst(Loop* L)
+    {
+      for(auto bbe=L->block_begin();bbe!=L->block_end();++bbe)
+      {
+        auto bb=*bbe;
+        for(auto& I:*bb)
+        {
+          if(auto inst=dyn_cast<CallInst>(&I))
+          {
+            auto funcName=inst->getCalledFunction()->getName();
+            if(catFuncName.count(funcName)||funcName=="CAT_get")
+            {
+              return true;
+            }
+          }
+        }
+      }
+      return false;
+    }
+    bool unrollAndPeelLoop(
+        LoopInfo &LI, 
+        Loop *loop, 
+        DominatorTree &DT, 
+        ScalarEvolution &SE, 
+        AssumptionCache &AC,
+        OptimizationRemarkEmitter &ORE,
+        TargetTransformInfo &TTI)
+    {
+      bool modified = false;
+      std::vector<Loop *> subLoops = loop->getSubLoops();
+      for (auto j:subLoops)
+      {
+          auto subloop = &*j;
+          if(subloop->getLoopDepth() >10) continue;
+          if (unrollAndPeelLoop(LI, subloop, DT, SE, AC, ORE, TTI))
+          {
+            return true;
+          }       
+      }
+      if(loop->getLoopDepth() >10) //skip nested loops with depth >5
+          return false;
+      errs()<<"\n\nTrying to unroll/peel ";
+      loop->print(errs());
+      
+      if (!(loop->isLoopSimplifyForm()  && loop->isLCSSAForm(DT)))
+      {
+          errs()<<"\nloop not normalized"; 
+          return false; 
+      }
+      errs()<<"\n\nTrying to unroll loop";
+      auto tripCount=SE.getSmallConstantTripCount(loop);
+      auto tripMultiple=SE.getSmallConstantTripMultiple(loop);
+      auto peelingCount = 1;
+      UnrollLoopOptions ULO;
+      ULO.Count=2;
+      ULO.AllowExpensiveTripCount=true;
+      ULO.Force=false;
+      ULO.ForgetAllSCEV=true;
+      ULO.Runtime=false;
+      ULO.UnrollRemainder=false;
+      LoopUnrollResult unrolled;
+      if(tripMultiple > 1)
+      {
+          if ((tripCount >0) && (tripCount<20))
+          {
+            ULO.Count=tripCount;
+            peelingCount = 0;
+          }
+          errs() << "\n   Trip count: " << tripCount << "\n";
+          errs() << "\n   Trip multiple: " << tripMultiple << "\n";
+          unrolled = UnrollLoop(loop, ULO,&LI, &SE, &DT, &AC, &TTI,&ORE,true);
+          if (unrolled != LoopUnrollResult::Unmodified )
+          {
+              errs()<<"\nloop unrolling-- success";
+              return true;
+          }
+          else
+          {
+              errs()<<"\nloop unrolling -- failed";
+          }
+      }
+      if(!canPeel(loop))
+      {
+        BasicBlock *LatchBlock = loop->getLoopLatch();
+        BranchInst *BI = dyn_cast<BranchInst>(LatchBlock->getTerminator());
+        if (!BI || BI->isUnconditional()) 
+        {
+            SimplifyQuery SQ(*DL, BI);
+            bool rotated = LoopRotation(loop, 
+                &LI, &TTI, &AC, &DT, &SE, 
+                nullptr, SQ, 
+                false, -1, false);
+            errs()<<"\nRotated loop for peeling/unrolling";
+        }
+      }
+      if(!canPeel(loop)) return false;
+      peelingCount = 1;
+      errs() << "\n   PeelingCount: " << peelingCount << "\n";
+      if(peelLoop( loop, peelingCount, &LI, &SE, DT, &AC, true))
+      {
+          errs() << "loop peeling-- success\n";
+          return false ;
+      }
+      else
+      {
+          errs()<<"loop peeling-- failed\n";
+      }
+      return false;
+    }
+    void loopTransform(Function& F)
+    {
+      if(F.isDeclaration())return;
+      if(F.getNumUses()==0&&(&F!=mainF))return;
+      if(F.getInstructionCount() > 500) return;
+      auto& LI = getAnalysis<LoopInfoWrapperPass>(F).getLoopInfo();
+      if(LI.empty()) return;
+      auto& DT = getAnalysis<DominatorTreeWrapperPass>(F).getDomTree();
+      auto& SE = getAnalysis<ScalarEvolutionWrapperPass>(F).getSE();
+      auto &AC = getAnalysis<AssumptionCacheTracker>().getAssumptionCache(F); 
+      auto &TTI = getAnalysis<TargetTransformInfoWrapperPass>().getTTI(F);
+      OptimizationRemarkEmitter ORE(&F);
+      errs()<<"do loop transofrm for "<<F.getName()<<'\n';
+      vector<Loop*>vec;
+      for(auto i:LI)
+      {
+        auto loop=&*i;
+        if(!hasCatInst(loop))continue;
+        vec.push_back(loop);
+      }
+      errs()<<"total loop count is:"<<vec.size()<<'\n';
+      for(auto loop:vec)
+      {
+        unrollAndPeelLoop(
+          LI, loop, DT, SE, AC, ORE, TTI
+        );
+      }
+    }
+    bool runOnModule (Module &M) override {
+      for(auto&F: M)cloneTest(F);
+      for(auto& F:M)loopTransform(F);
+      for(auto& F:M)
+      {
+        init(F);
+        constantPropagation(F);
+      }
       return false;
     }
     bool checkRecursive(Function& F)
@@ -758,8 +938,8 @@ namespace {
           auto funcName=callee->getName();
           if(!catFuncName.count(funcName)&&funcName!="CAT_get"&&fName!=funcName&&!checkRecursive(*callee))
           {
-            errs()<<"replace function for ins "<<*inst<<"\n";
-            errs()<<"replace "<<funcName<<"\n";
+            //errs()<<"replace function for ins "<<*inst<<"\n";
+            //errs()<<"replace "<<funcName<<"\n";
             rep.insert(inst);
           }
         }
@@ -767,7 +947,7 @@ namespace {
       for(auto inst:rep)
       {
         InlineFunctionInfo  IFI;
-        auto inlinedResult = InlineFunction(*inst, IFI);
+        InlineFunction(*inst, IFI);
       }
     }
     void printUse(Instruction* I)
@@ -784,6 +964,23 @@ namespace {
         }
       }
       errs()<<"\n";
+    }
+    bool getDetele()
+    {
+      //errs()<<"start checking\n"<<'\n';
+      for(auto& I:instructions(*mainF))
+      {
+        if(auto inst=dyn_cast<CallInst>(&I))
+        {
+          auto funcName=inst->getCalledFunction()->getName();
+         // errs()<<funcName<<'\n';
+          if(funcName=="CAT_variables")
+          {
+            return false;
+          }
+        }
+      }
+      return true;
     }
     void printInAndOut(Function &F)
     {
@@ -864,8 +1061,13 @@ namespace {
       }
     }
     void getAnalysisUsage(AnalysisUsage &AU) const override {
-      AU.addRequired<AAResultsWrapperPass>();
-      AU.setPreservesAll();
+      AU.addRequired< CallGraphWrapperPass >();
+      AU.addRequired< AAResultsWrapperPass >();
+      AU.addRequired<AssumptionCacheTracker>();
+      AU.addRequired<DominatorTreeWrapperPass>();
+      AU.addRequired<LoopInfoWrapperPass>();
+      AU.addRequired<ScalarEvolutionWrapperPass>();
+      AU.addRequired<TargetTransformInfoWrapperPass>();
     }
   };
 }
